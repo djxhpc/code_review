@@ -11,6 +11,7 @@
 import json
 import os
 import queue
+import re
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -49,6 +50,129 @@ CODE_EXTENSIONS = {
 }
 
 MAX_CODE_CHARS = 24000  # 避免超出小模型 context window
+
+# ===== 新增：排除規則 =====
+
+# 要跳過的資料夾名稱
+SKIP_DIRS = {
+    # 套件管理
+    "node_modules", "bower_components",
+    # Python
+    "__pycache__", ".venv", "venv", "env", ".env",
+    "site-packages", ".mypy_cache", ".pytest_cache",
+    ".ruff_cache", ".tox", "eggs", "*.egg-info",
+    # 版本控制
+    ".git", ".svn", ".hg",
+    # IDE / 編輯器
+    ".idea", ".vscode", ".vs",
+    # 打包產物
+    "dist", "build", "out", "target", "bin", "obj",
+    "Release", "Debug", "cmake-build-debug",
+    # 前端
+    ".next", ".nuxt", ".output", ".cache",
+    "coverage", ".nyc_output", "storybook-static",
+    # Go
+    "vendor",
+    # 其他
+    ".terraform", ".serverless",
+}
+
+# 要跳過的檔案名稱（完全比對）
+SKIP_FILES = {
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Pipfile.lock",
+    "poetry.lock",
+    "composer.lock",
+    "Gemfile.lock",
+    "Cargo.lock",
+    "go.sum",
+    ".DS_Store",
+    "Thumbs.db",
+    ".gitignore",
+    ".gitattributes",
+    ".editorconfig",
+    ".prettierrc",
+    ".eslintrc",
+    ".browserslistrc",
+}
+
+# 要跳過的副檔名
+SKIP_EXTENSIONS = {
+    ".pyc", ".pyo", ".pyd",
+    ".so", ".dll", ".dylib", ".exe",
+    ".class", ".jar", ".war",
+    ".min.js", ".min.css",
+    ".map",           # source map
+    ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico",
+    ".woff", ".woff2", ".ttf", ".eot",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx",
+    ".zip", ".tar", ".gz", ".rar", ".7z",
+    ".mp3", ".mp4", ".wav", ".avi",
+    ".db", ".sqlite", ".sqlite3",
+    ".log",
+    ".env",           # 可能含密碼
+    ".lock",
+    ".cache",
+    ".txt",
+    ".csv",
+}
+
+# 檔案大小上限（單檔超過此值直接跳過，通常是自動產生的）
+MAX_SINGLE_FILE_SIZE = 100_000  # 100 KB
+
+# 每批次字元上限（超過會拆到下一批）
+BATCH_CHARS = 20_000
+
+
+def should_skip_file(filepath):
+    """判斷這個檔案是否應該跳過"""
+    filename = os.path.basename(filepath)
+    ext = os.path.splitext(filename)[1].lower()
+
+    # 1. 檔名完全比對
+    if filename in SKIP_FILES:
+        return True
+
+    # 2. 副檔名比對
+    if ext in SKIP_EXTENSIONS:
+        return True
+
+    # 3. 特殊檔名模式
+    if filename.endswith(".min.js") or filename.endswith(".min.css"):
+        return True
+    if filename.startswith("."):  # 隱藏檔（可選，視需求）
+        # 但保留 .env.example 之類的
+        if ext not in CODE_EXTENSIONS:
+            return True
+
+    # 4. 檔案大小
+    try:
+        if os.path.getsize(filepath) > MAX_SINGLE_FILE_SIZE:
+            return True
+    except OSError:
+        return True
+
+    # 5. 必須是我們認識的程式碼副檔名
+    if ext not in CODE_EXTENSIONS:
+        return True
+
+    return False
+
+
+def should_skip_dir(dirname):
+    """判斷這個資料夾是否應該跳過"""
+    # 完全比對
+    if dirname in SKIP_DIRS:
+        return True
+    # 隱藏資料夾（以 . 開頭）
+    if dirname.startswith("."):
+        return True
+    # 常見模式
+    if dirname.endswith(".egg-info"):
+        return True
+    return False
 
 REVIEW_SYSTEM_PROMPT = """角色
 
@@ -107,10 +231,7 @@ Phase 4：總結與決策
 嚴重程度標籤
 🔴 [blocking]：必須修正
 🟡 [important]：建議修正
-🟢 [nit]：可選優化
-💡 [suggestion]：替代方案
-📚 [learning]：知識分享／教育性建議
-🎉 [praise]：值得讚賞
+🟢 [praise]：值得讚賞
 
 輸出格式
 程式碼審查報告
@@ -127,7 +248,7 @@ Phase 4：總結與決策
 原始程式碼 vs 建議修改
 
 🟡 建議修改
-🟢 可選優化
+🟢 值得讚賞
 亮點
 總結
 
@@ -135,7 +256,7 @@ Phase 4：總結與決策
 
 INTEGRATION_SYSTEM_PROMPT = """角色
 
-你是一位經驗豐富的技術主管，同時也是 Code Review 流程的整合者。你收到四位不同的 AI 審查專家針對「同一份程式碼」各自獨立完成的 Code Review 報告，你的任務是將這四份報告去蕪存菁，整合成一份最終審查報告。
+你是一位經驗豐富的技術主管，同時也是 Code Review 流程的整合者。你收到多份 AI 審查專家針對「同一份程式碼」各自獨立完成的 Code Review 報告與中間摘要，你的任務是將這些材料去蕪存菁，整合成一份最終審查報告。
 
 任務
 
@@ -182,10 +303,7 @@ Phase 4：總結與決策
 嚴重程度標籤
 🔴 [blocking]：必須修正
 🟡 [important]：建議修正
-🟢 [nit]：可選優化
-💡 [suggestion]：替代方案
-📚 [learning]：知識分享／教育性建議
-🎉 [praise]：值得讚賞
+🟢 [praise]：值得讚賞
 
 輸出格式
 程式碼審查整合報告
@@ -201,11 +319,37 @@ Phase 4：總結與決策
 建議
 
 🟡 建議修改
-🟢 可選優化
+🟢 值得讚賞
 亮點
 總結與最終決策
 
 請全程使用「繁體中文」（台灣用語習慣）撰寫，不要使用簡體字，也不要輸出程式碼區塊。"""
+
+INTEGRATION_PARTIAL_PROMPT = """角色
+
+你是一位經驗豐富的技術主管，正在進行 Code Review 報告的初步整合。你收到的是一部分（而非全部）的 AI 審查意見。
+
+任務
+
+請閱讀以下這批審查意見，整理出一個簡潔的中間摘要，包含：
+- 每個問題的簡短描述
+- 問題所在的檔案或位置
+- 嚴重程度判斷
+
+請勿輸出完整的審查報告格式，只需條列重點。這個摘要後續會與其他批次的摘要合併以產生最終報告。
+
+輸出格式
+## 第 X 批審查摘要
+### 🔴 關鍵問題
+- 問題描述（位置）[嚴重程度]
+
+### 🟡 建議事項
+...
+
+### 📌 其他觀察
+...
+
+請全程使用「繁體中文」（台灣用語習慣）撰寫，不要使用簡體字。"""
 
 
 def get_installed_models():
@@ -217,7 +361,16 @@ def get_installed_models():
         return []
 
 
-NUM_CTX = 16384  # 部分模型(如 qwythos)預設 context 只有 8192，容易被程式碼塞爆，明確調大
+MODEL_CONTEXT = {
+    "ornith:9b": 8192,
+    "codellama:7b": 16384,
+    "richardyoung/qwythos-9b-abliterated:Q8_0": 32768,
+    "gemma4:e4b": 32768,
+}
+
+
+def _get_num_ctx(model):
+    return MODEL_CONTEXT.get(model, 16384)
 
 
 def stream_chat(model, system_prompt, user_content, on_chunk, stop_event):
@@ -228,7 +381,7 @@ def stream_chat(model, system_prompt, user_content, on_chunk, stop_event):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        "options": {"num_ctx": NUM_CTX},
+        "options": {"num_ctx": _get_num_ctx(model)},
         "stream": True,
     }
     with requests.post(f"{OLLAMA_URL}/api/chat", json=payload, stream=True, timeout=600) as resp:
@@ -294,11 +447,17 @@ class CodeReviewApp:
         installed = get_installed_models()
         default_integrator = DEFAULT_INTEGRATOR if DEFAULT_INTEGRATOR in installed else (installed[0] if installed else DEFAULT_INTEGRATOR)
         self.integrator_var = tk.StringVar(value=default_integrator)
-        integrator_combo = ttk.Combobox(
+        self.integrator_combo = ttk.Combobox(
             opt_frame, textvariable=self.integrator_var,
             values=installed or [DEFAULT_INTEGRATOR], width=32, state="readonly",
         )
-        integrator_combo.pack(anchor="w", padx=4, pady=(0, 6))
+        self.integrator_combo.pack(anchor="w", padx=4, pady=(0, 6))
+
+        self.auto_integrate_var = tk.BooleanVar(value=True)
+        self.auto_integrate_cb = ttk.Checkbutton(
+            opt_frame, text="審查完成後自動整合", variable=self.auto_integrate_var,
+        )
+        self.auto_integrate_cb.pack(anchor="w", padx=4, pady=(0, 4))
 
         btn_frame = ttk.Frame(self.root, padding=8)
         btn_frame.pack(fill="x")
@@ -310,9 +469,14 @@ class CodeReviewApp:
         self.integrate_btn.pack(side="left", padx=(6, 0))
         self.save_btn = ttk.Button(btn_frame, text="另存全部結果", command=self.save_results, state="disabled")
         self.save_btn.pack(side="left", padx=(6, 0))
+        self.export_csv_btn = ttk.Button(btn_frame, text="匯出 CSV", command=self._export_csv, state="disabled")
+        self.export_csv_btn.pack(side="left", padx=(6, 0))
 
         self.status_label = ttk.Label(btn_frame, text="就緒")
         self.status_label.pack(side="left", padx=12)
+
+        self.progress_bar = ttk.Progressbar(btn_frame, mode="determinate", length=120)
+        self.progress_bar.pack(side="left", padx=(0, 8))
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -330,32 +494,72 @@ class CodeReviewApp:
         self.integ_text = tk.Text(integ_frame, wrap="word", font=("Consolas", 10))
         self.integ_text.pack(fill="both", expand=True)
 
-    # ---------- 檔案選擇 ----------
-    def choose_folder(self):
-        folder = filedialog.askdirectory(title="選擇要審查的資料夾")
-        if not folder:
-            return
-        files = []
-        for dirpath, _dirnames, filenames in os.walk(folder):
-            for fn in filenames:
-                if os.path.splitext(fn)[1].lower() in CODE_EXTENSIONS:
-                    files.append(os.path.join(dirpath, fn))
-        self._set_files(files, folder)
-
-    def choose_files(self):
-        files = filedialog.askopenfilenames(title="選擇要審查的程式檔")
-        if not files:
-            return
-        self._set_files(list(files), f"{len(files)} 個檔案")
+        self.issue_frame = ttk.Frame(self.notebook)
+        self.issue_tree = ttk.Treeview(
+            self.issue_frame,
+            columns=("severity", "num", "title", "consensus", "location", "risk", "suggestion"),
+            show="headings", height=12,
+        )
+        col_defs = [
+            ("severity", "嚴重程度", 110),
+            ("num", "#", 40),
+            ("title", "標題", 250),
+            ("consensus", "共識", 60),
+            ("location", "位置", 200),
+            ("risk", "風險說明", 250),
+            ("suggestion", "建議修正", 300),
+        ]
+        for key, text, width in col_defs:
+            self.issue_tree.heading(key, text=text)
+            self.issue_tree.column(key, width=width, minwidth=40)
+        self.issue_tree.pack(fill="both", expand=True, padx=4, pady=4)
+        for col in ("severity", "num", "title", "consensus", "location", "risk", "suggestion"):
+            self.issue_tree.heading(
+                col,
+                command=lambda _c=col: self.treeview_sort_column(self.issue_tree, _c, False),
+            )
+        self.issue_tree.bind("<<TreeviewSelect>>", self._on_issue_select)
 
     def _set_files(self, files, label):
         self.selected_files = files
         self.path_label.config(text=label)
         self.file_listbox.delete(0, "end")
         for f in files:
-            self.file_listbox.insert("end", f)
+            # 顯示相對路徑 + 檔案大小，方便使用者判斷
+            size_kb = os.path.getsize(f) / 1024
+            display = f"{f}  ({size_kb:.0f} KB)"
+            self.file_listbox.insert("end", display)
+        # 預設全選
         for i in range(len(files)):
             self.file_listbox.selection_set(i)
+
+    # ---------- 檔案選擇 ----------
+    def choose_folder(self):
+        folder = filedialog.askdirectory(title="選擇要審查的資料夾")
+        if not folder:
+            return
+        files = []
+        for dirpath, dirnames, filenames in os.walk(folder):
+            # ★ 關鍵：原地修改 dirnames，os.walk 就不會進入這些子目錄
+            dirnames[:] = [
+                d for d in dirnames
+                if not should_skip_dir(d)
+            ]
+
+            for fn in filenames:
+                full_path = os.path.join(dirpath, fn)
+                if not should_skip_file(full_path):
+                    files.append(full_path)
+
+        # 排序讓結果可預期
+        files.sort()
+        self._set_files(files, f"{folder}（{len(files)} 個程式檔）")
+
+    def choose_files(self):
+        files = filedialog.askopenfilenames(title="選擇要審查的程式檔")
+        if not files:
+            return
+        self._set_files(list(files), f"{len(files)} 個檔案")
 
     def _get_checked_files(self):
         idxs = self.file_listbox.curselection()
@@ -371,6 +575,14 @@ class CodeReviewApp:
         if not models:
             messagebox.showwarning("提醒", "請至少勾選一個模型")
             return
+        installed = get_installed_models()
+        models = [m for m in models if m in installed]
+        if not models:
+            messagebox.showwarning("提醒", "你選擇的模型在本機 Ollama 中都不存在，請先拉取模型")
+            return
+        missing = set(m for m, v in self.model_vars.items() if v.get()) - set(models)
+        if missing:
+            self.status_label.config(text=f"以下模型不存在，已略過：{', '.join(sorted(missing))}")
 
         for m in REVIEW_MODELS:
             self.text_widgets[m].delete("1.0", "end")
@@ -383,43 +595,93 @@ class CodeReviewApp:
         self.stop_btn.config(state="normal")
         self.integrate_btn.config(state="disabled")
         self.save_btn.config(state="disabled")
+        self.export_csv_btn.config(state="disabled")
+
+        self.progress_bar["value"] = 0
+        self.integrator_combo.config(state="disabled")
+        self.auto_integrate_cb.config(state="disabled")
 
         self.worker_thread = threading.Thread(
             target=self._review_worker, args=(files, models), daemon=True
         )
         self.worker_thread.start()
 
-    def _review_worker(self, files, models):
-        code_blocks = []
+    def _prepare_batches(self, files):
+        """把檔案讀取、截斷、按 BATCH_CHARS 分批，回傳 list[str]"""
+        batches = []
+        current_blocks = []
+        current_size = 0
+
         for path in files:
+            if self.stop_event.is_set():
+                break
             try:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
             except Exception as e:
                 content = f"(讀取失敗: {e})"
+
             if len(content) > MAX_CODE_CHARS:
-                content = content[:MAX_CODE_CHARS] + "\n... (內容過長，已截斷)"
-            code_blocks.append(f"### 檔案: {path}\n```\n{content}\n```")
-        user_content = "請審查以下程式碼：\n\n" + "\n\n".join(code_blocks)
+                content = content[:MAX_CODE_CHARS] + "\n... (單檔過長，已截斷)"
+
+            block = f"### 檔案: {os.path.basename(path)}\n```\n{content}\n```"
+            block_size = len(block)
+
+            if current_size + block_size > BATCH_CHARS and current_blocks:
+                batches.append("\n\n".join(current_blocks))
+                current_blocks = []
+                current_size = 0
+
+            current_blocks.append(block)
+            current_size += block_size
+
+        if current_blocks:
+            batches.append("\n\n".join(current_blocks))
+
+        return batches
+
+    def _review_worker(self, files, models):
+        batches = self._prepare_batches(files)
+        total_batches = len(batches)
+        total_steps = len(models) * total_batches
+
+        self.ui_queue.put(("setup_progress", total_steps))
 
         for model in models:
             if self.stop_event.is_set():
                 break
-            self.ui_queue.put(("status", f"正在執行 {model} ..."))
 
-            def on_chunk(chunk, _model=model):
-                self.ui_queue.put(("append", _model, chunk))
+            for batch_idx, batch_content in enumerate(batches, 1):
+                if self.stop_event.is_set():
+                    break
 
-            try:
-                stream_chat(model, REVIEW_SYSTEM_PROMPT, user_content, on_chunk, self.stop_event)
-            except Exception as e:
-                self.ui_queue.put(("append", model, f"\n\n[錯誤] 呼叫模型失敗: {e}"))
+                user_content = f"請審查以下程式碼（第 {batch_idx}/{total_batches} 批）：\n\n{batch_content}"
+
+                self.ui_queue.put(("status", f"{model} - 第 {batch_idx}/{total_batches} 批"))
+
+                if batch_idx > 1:
+                    self.ui_queue.put(("append", model, f"\n\n--- 第 {batch_idx}/{total_batches} 批 ---\n\n"))
+
+                def on_chunk(chunk, _model=model):
+                    self.ui_queue.put(("append", _model, chunk))
+
+                try:
+                    stream_chat(model, REVIEW_SYSTEM_PROMPT, user_content, on_chunk, self.stop_event)
+                except Exception as e:
+                    self.ui_queue.put(("append", model, f"\n\n[錯誤] 呼叫模型失敗: {e}"))
+
+                self.ui_queue.put(("batch_done",))
+
             self.ui_queue.put(("model_done", model))
 
         self.ui_queue.put(("all_done",))
 
     def stop_review(self):
         self.stop_event.set()
+        self.progress_bar["value"] = 0
+        self.integrator_combo.config(state="readonly")
+        self.auto_integrate_cb.config(state="normal")
+        self.export_csv_btn.config(state="disabled")
         self.status_label.config(text="已要求停止...")
 
     # ---------- 整合 ----------
@@ -433,22 +695,195 @@ class CodeReviewApp:
         self.integrate_btn.config(state="disabled")
         self.stop_event.clear()
         self.integ_text.delete("1.0", "end")
+        self.integration_result = ""
         self.notebook.select(len(REVIEW_MODELS))
         self.status_label.config(text=f"正在用 {model} 整合結果...")
 
+        # 將各模型報告按 BATCH_CHARS 分組（不分割單份報告）
         parts = [f"【{m} 的審查意見】\n{txt}" for m, txt in reviews.items()]
-        user_content = "\n\n".join(parts)
+        batches = []
+        current = []
+        current_size = 0
+        for part in parts:
+            if current_size + len(part) > BATCH_CHARS and current:
+                batches.append(current)
+                current = []
+                current_size = 0
+            current.append(part)
+            current_size += len(part)
+        if current:
+            batches.append(current)
+
+        total_batches = len(batches)
+
+        self.progress_bar["maximum"] = total_batches
+        self.progress_bar["value"] = 0
 
         def worker():
-            def on_chunk(chunk):
-                self.ui_queue.put(("integ_append", chunk))
-            try:
-                stream_chat(model, INTEGRATION_SYSTEM_PROMPT, user_content, on_chunk, self.stop_event)
-            except Exception as e:
-                self.ui_queue.put(("integ_append", f"\n\n[錯誤] 整合失敗: {e}"))
+            partial_summaries = []
+
+            for batch_idx, batch_parts in enumerate(batches):
+                if self.stop_event.is_set():
+                    break
+
+                is_last = (batch_idx == total_batches - 1)
+
+                if is_last:
+                    # 最終批次：合併先前的中間摘要 + 這批原始報告
+                    combined_parts = []
+                    if partial_summaries:
+                        combined_parts.append("【先前批次的中間摘要】\n" + "\n\n".join(partial_summaries))
+                    combined_parts.append("【最後一批原始審查意見】\n" + "\n\n".join(batch_parts))
+                    user_content = "\n\n".join(combined_parts)
+                    prompt = INTEGRATION_SYSTEM_PROMPT
+                    self.ui_queue.put(("status", "整合 - 最終合併階段"))
+                else:
+                    user_content = "\n\n".join(batch_parts)
+                    prompt = INTEGRATION_PARTIAL_PROMPT
+                    self.ui_queue.put(("status", f"整合 - 第 {batch_idx+1}/{total_batches} 批（中間摘要）"))
+
+                # 收集完整回應
+                buf = []
+
+                def on_chunk(chunk, _final=is_last):
+                    if _final:
+                        self.ui_queue.put(("integ_append", chunk))
+                    buf.append(chunk)
+
+                try:
+                    stream_chat(model, prompt, user_content, on_chunk, self.stop_event)
+                except Exception as e:
+                    if is_last:
+                        self.ui_queue.put(("integ_append", f"\n\n[錯誤] 整合失敗: {e}"))
+
+                if not is_last:
+                    partial_summaries.append("".join(buf))
+                elif not self.stop_event.is_set():
+                    self.ui_queue.put(("integ_append", ""))
+
+                self.ui_queue.put(("integ_batch_done",))
+
             self.ui_queue.put(("integ_done",))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    # ---------- 解析 / 匯出 ----------
+    def _parse_issues_from_report(self, text):
+        """從整合報告文字中解析出結構化問題清單"""
+        if not text:
+            return []
+        severity_map = {
+            "🔴 嚴重問題": "🔴 嚴重 (Blocking)",
+            "🟡 建議修改": "🟡 建議 (Important)",
+            "🟢 可選優化": "🟢 可選 (Nit)",
+            "💡 替代方案": "💡 替代方案 (Suggestion)",
+            "📚 知識分享": "📚 知識分享／教育性建議 (Learning)",
+            "🎉 值得讚賞": "🎉 值得讚賞 (Praise)",
+        }
+        issue_pat = re.compile(
+            r"問題\s*(\d+)\s*：\s*【(.+?)】\s*(?:（共識：(\d+/\d+)\s*個模型提及）)?"
+        )
+        results = []
+        current_severity = None
+        current_issue = None
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped in severity_map:
+                current_severity = severity_map[stripped]
+                continue
+            m = issue_pat.search(stripped)
+            if m:
+                if current_issue:
+                    results.append(current_issue)
+                current_issue = {
+                    "severity": current_severity or "",
+                    "number": m.group(1),
+                    "title": m.group(2),
+                    "consensus": m.group(3) or "",
+                    "location": "",
+                    "risk": "",
+                    "suggestion": "",
+                }
+                continue
+            if stripped == "位置" and current_issue is not None:
+                current_issue["_sec"] = "location"; continue
+            if stripped == "風險" and current_issue is not None:
+                current_issue["_sec"] = "risk"; continue
+            if stripped == "建議" and current_issue is not None:
+                current_issue["_sec"] = "suggestion"; continue
+            if current_issue is not None and current_issue.get("_sec"):
+                sec = current_issue["_sec"]
+                if current_issue[sec]:
+                    current_issue[sec] += " "
+                current_issue[sec] += stripped
+        if current_issue:
+            results.append(current_issue)
+        for r in results:
+            r.pop("_sec", None)
+        return results
+
+    def _export_csv(self):
+        rows = self._parse_issues_from_report(self.integration_result)
+        if not rows:
+            messagebox.showinfo("提示", "整合報告中未解析到結構化問題清單")
+            return
+        import csv
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+            initialfile=f"codereview_issues_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        )
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=[
+                "severity", "number", "title", "consensus",
+                "location", "risk", "suggestion",
+            ])
+            w.writeheader()
+            w.writerows(rows)
+        messagebox.showinfo("完成", f"已匯出 CSV 至：\n{path}")
+
+    def _populate_issue_table(self):
+        """解析整合報告並填入問題清單 Treeview"""
+        for item in self.issue_tree.get_children():
+            self.issue_tree.delete(item)
+        rows = self._parse_issues_from_report(self.integration_result)
+        if rows:
+            for r in rows:
+                self.issue_tree.insert("", "end", values=(
+                    r["severity"], r["number"], r["title"], r["consensus"],
+                    r["location"], r["risk"], r["suggestion"],
+                ))
+            self.notebook.add(self.issue_frame)
+        else:
+            try:
+                self.notebook.hide(self.issue_frame)
+            except tk.TclError:
+                pass
+
+    def treeview_sort_column(self, tv, col, reverse):
+        l = [(tv.set(k, col), k) for k in tv.get_children("")]
+        l.sort(key=lambda x: (x[0] or ""), reverse=reverse)
+        for index, (_, k) in enumerate(l):
+            tv.move(k, "", index)
+        tv.heading(col, command=lambda: self.treeview_sort_column(tv, col, not reverse))
+
+    def _on_issue_select(self, event):
+        sel = self.issue_tree.selection()
+        if not sel:
+            return
+        values = self.issue_tree.item(sel[0], "values")
+        if len(values) < 2:
+            return
+        num = values[1]
+        tag = f"問題 {num}："
+        pos = self.integ_text.search(tag, "1.0", tk.END)
+        if pos:
+            self.notebook.select(len(REVIEW_MODELS) + 1)  # integ report tab index
+            self.integ_text.see(pos)
 
     # ---------- 儲存 ----------
     def save_results(self):
@@ -482,6 +917,14 @@ class CodeReviewApp:
                     self.review_results[model] += chunk
                     self.text_widgets[model].insert("end", chunk)
                     self.text_widgets[model].see("end")
+                elif kind == "setup_progress":
+                    self.progress_bar["maximum"] = item[1]
+                    self.progress_bar["value"] = 0
+                elif kind == "batch_done":
+                    self.progress_bar.step(1)
+                    done = int(self.progress_bar["value"])
+                    total = int(self.progress_bar["maximum"])
+                    self.status_label.config(text=f"已處理 {done}/{total} 批")
                 elif kind == "model_done":
                     _, model = item
                     converted = to_traditional(self.review_results[model])
@@ -494,14 +937,27 @@ class CodeReviewApp:
                 elif kind == "all_done":
                     self.run_btn.config(state="normal")
                     self.stop_btn.config(state="disabled")
-                    self.integrate_btn.config(state="normal")
+                    self.integrator_combo.config(state="readonly")
+                    self.auto_integrate_cb.config(state="normal")
                     self.save_btn.config(state="normal")
-                    self.status_label.config(text="四個模型審查完成，可以按「整合結果」")
+                    if self.auto_integrate_var.get():
+                        self.status_label.config(text="所有模型審查完成，正在整合...")
+                        self.start_integration()
+                    else:
+                        self.integrate_btn.config(state="normal")
+                        self.status_label.config(text="所有模型審查完成，可以按「整合結果」")
                 elif kind == "integ_append":
                     self.integration_result += item[1]
                     self.integ_text.insert("end", item[1])
                     self.integ_text.see("end")
+                elif kind == "integ_batch_done":
+                    self.progress_bar.step(1)
+                    done = int(self.progress_bar["value"])
+                    total = int(self.progress_bar["maximum"])
+                    self.status_label.config(text=f"整合中 {done}/{total} 批")
                 elif kind == "integ_done":
+                    self.integrator_combo.config(state="readonly")
+                    self.auto_integrate_cb.config(state="normal")
                     converted = to_traditional(self.integration_result)
                     if converted != self.integration_result:
                         self.integration_result = converted
@@ -509,6 +965,8 @@ class CodeReviewApp:
                         self.integ_text.insert("end", converted)
                     self.integrate_btn.config(state="normal")
                     self.save_btn.config(state="normal")
+                    self.export_csv_btn.config(state="normal")
+                    self._populate_issue_table()
                     self.status_label.config(text="整合報告完成")
         except queue.Empty:
             pass
